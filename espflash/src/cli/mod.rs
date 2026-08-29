@@ -56,6 +56,11 @@ use crate::{
     target::{Chip, ProgressCallbacks, XtalFrequency},
 };
 
+// Linux-only: built on `nix::pty` (posix_openpt/grantpt/unlockpt/
+// ptsname_r), which is only available on Linux - see that module's doc
+// comment.
+#[cfg(target_os = "linux")]
+pub mod bridge;
 pub mod config;
 pub mod monitor;
 
@@ -412,6 +417,34 @@ pub fn connect(
     no_verify: bool,
     no_skip: bool,
 ) -> Result<Flasher> {
+    // The only fork-specific branch in this whole function (see
+    // `bridge::connect`'s doc comment): `--port bridge://<host>` skips the
+    // usual serial-port discovery/open entirely and hands back a
+    // `Connection` built on a local PTY relayed through an ESP32 debug
+    // bridge over WiFi instead. Everything below this - and everything
+    // every other command in this crate does with the resulting `Flasher`
+    // - is unmodified upstream logic. Linux-only, see `bridge`'s `cfg`.
+    #[cfg(target_os = "linux")]
+    if let Some(port) = args.port.as_deref()
+        && let Some(host) = bridge::target_host(port)
+    {
+        let connection = bridge::connect(host, args.before, args.after)?;
+        return Ok(Flasher::connect(
+            connection,
+            !args.no_stub,
+            !no_verify,
+            !no_skip,
+            args.chip,
+            args.baud.or(config.project_config.baudrate),
+        )?);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(port) = args.port.as_deref()
+        && port.starts_with("bridge://")
+    {
+        miette::bail!("bridge:// targets are only supported on Linux");
+    }
+
     if args.before == ResetBeforeOperation::NoReset
         || args.before == ResetBeforeOperation::NoResetNoSync
     {

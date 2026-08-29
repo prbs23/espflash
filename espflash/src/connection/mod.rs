@@ -235,6 +235,15 @@ pub struct Connection {
     before_operation: ResetBeforeOperation,
     pub(crate) secure_download_mode: bool,
     pub(crate) baud: u32,
+    /// Set only by `cli::bridge::connect` for a connection made through an
+    /// ESP32 debug/programming bridge (see `cli/bridge.rs`) rather than a
+    /// real serial port. `serial` in that case is a local PTY with no real
+    /// control lines, so `reset_after` can't drive DTR/RTS on it - when
+    /// this is set, `reset_after` hits the bridge's HTTP `/reset` endpoint
+    /// instead of the usual reset strategies. This is the *only* addition
+    /// to this struct/impl in this fork; nothing else here is modified
+    /// from upstream `espflash`.
+    pub(crate) bridge_host: Option<String>,
 }
 
 impl Connection {
@@ -254,6 +263,7 @@ impl Connection {
             before_operation,
             secure_download_mode: false,
             baud,
+            bridge_host: None,
         }
     }
 
@@ -396,6 +406,17 @@ impl Connection {
 
     /// Resets the device.
     pub fn reset(&mut self) -> Result<(), Error> {
+        // Same reasoning as the `bridge_host` check in `reset_after` below:
+        // a bridge connection's `serial` is a PTY with no real control
+        // lines, so the DTR/RTS-based `reset_after_flash` below can't do
+        // anything useful on it (and its ioctls fail outright - PTYs don't
+        // support `TIOCMGET`/`TIOCMSET`). Reboot via the bridge's HTTP
+        // endpoint instead.
+        #[cfg(all(feature = "cli", target_os = "linux"))]
+        if let Some(host) = &self.bridge_host {
+            return crate::cli::bridge::hard_reset(host);
+        }
+
         reset_after_flash(&mut self.serial, self.port_info.pid)?;
 
         Ok(())
@@ -403,6 +424,24 @@ impl Connection {
 
     /// Resets the device taking into account the reset after argument.
     pub fn reset_after(&mut self, is_stub: bool, chip: Chip) -> Result<(), Error> {
+        // Bridge connections (see `bridge_host`'s doc comment) have no real
+        // control lines for `hard_reset` to drive - a `HardReset` there
+        // means "reboot the target", which only the bridge's own HTTP
+        // `/reset` endpoint can actually do (see `cli::bridge::hard_reset`).
+        // Every other `after_operation` below is a protocol-level command
+        // sent over the connection rather than a physical DTR/RTS action,
+        // so it works unmodified over the bridge's relayed PTY too.
+        //
+        // `bridge_host` is only ever set from `cli::bridge::connect`, which
+        // only exists behind the `cli` feature and on Linux - gated here
+        // to match, so this struct stays usable elsewhere without it.
+        #[cfg(all(feature = "cli", target_os = "linux"))]
+        if let (Some(host), ResetAfterOperation::HardReset) =
+            (&self.bridge_host, self.after_operation)
+        {
+            return crate::cli::bridge::hard_reset(host);
+        }
+
         let pid = self.usb_pid();
 
         match self.after_operation {

@@ -1,3 +1,84 @@
+## `espbridge` branch - this branch adds a network transport
+
+**This branch (`espbridge`) is a fork of upstream `espflash`**, adding
+exactly one thing on top: a `--port bridge://<host>` target that routes an
+otherwise completely normal `espflash` session through an [ESP32
+debug/programming bridge](/home/kit/esp32/esp32_debug_bridge/DESIGN.md)
+over WiFi instead of a local serial port. **Every command, every flag,
+and the `espflash` binary name itself are unmodified from upstream** -
+this is meant as a drop-in replacement, not a new tool with its own
+interface.
+
+```sh
+# Anywhere you'd normally do:
+espflash flash --chip esp32c61 --port /dev/ttyUSB0 firmware.elf
+# ...do this instead, no other flags change:
+espflash flash --chip esp32c61 --port bridge://192.168.1.50 firmware.elf
+
+espflash board-info --port bridge://192.168.1.50
+espflash monitor --port bridge://192.168.1.50 --chip esp32c61
+espflash reset --port bridge://192.168.1.50 --chip esp32c61
+```
+
+- `--port bridge://<host>` replaces the usual serial device path with a
+  bridge's hostname or IP. The bridge's HTTP control port (default `80`)
+  and raw flashing TCP port (default `3333`) are overridable via
+  `ESPBRIDGE_HTTP_PORT`/`ESPBRIDGE_FLASH_PORT` if your bridge changed them
+  from `bridge_fw`'s defaults.
+- **Linux only** - the bridge backend is built on `nix::pty`
+  (`posix_openpt`/`grantpt`/`unlockpt`), not available elsewhere. Building
+  with the `cli` feature on another OS still works; `bridge://` targets
+  just aren't available there (fails with a clear error instead of not
+  compiling).
+- **`hold-in-reset` has no bridge equivalent** and is unpatched - the
+  bridge's HTTP control endpoints (`bridge_fw`) only offer pulsed
+  reset/bootloader-entry, not an indefinite "assert and hold" primitive.
+  Every other command works, including `flash` (real ELF input, not just
+  a pre-merged binary - this branch doesn't reimplement any of
+  `espflash`'s own image-assembly logic, it runs unmodified), `board-info`,
+  `checksum-md5`, `erase-flash`/`erase-region`/`erase-parts`, `read-flash`,
+  `write-bin`, `reset`, and `monitor` (all confirmed hands-on against a
+  real bridge + target, 2026-08-29).
+- Baud is effectively fixed at 115200 - the bridge's target UART link
+  doesn't renegotiate mid-session (see `bridge_fw`'s README), so don't
+  pass a higher `--baud`.
+
+### What's actually changed from upstream
+
+Everything lives in `src/cli/bridge.rs` (new file, see its doc comment)
+plus small, clearly-commented additions at a handful of call sites that
+otherwise assume a real serial port with real DTR/RTS control lines:
+
+- `src/cli/mod.rs`: `pub mod bridge;`, and one new branch at the top of
+  `connect()` that hands off to `bridge::connect()` when `--port` names a
+  bridge, instead of the normal `serialport::available_ports()`-based
+  discovery (which would reject a bridge target outright - it's not real,
+  OS-discoverable serial hardware).
+- `src/connection/mod.rs`: one new field on `Connection`
+  (`pub(crate) bridge_host: Option<String>`, set only by
+  `bridge::connect`), and a check for it at the top of `reset()` and
+  `reset_after()` - both would otherwise try real DTR/RTS ioctls
+  (`TIOCMGET`/`TIOCMSET`) on the bridge's local PTY, which fails
+  (`ENOTTY`, "Not a typewriter") since a PTY has no real control lines.
+- `src/cli/monitor/mod.rs`: a small `reset_target` helper wrapping the
+  module's two direct `reset_after_flash` calls, for the same reason as
+  above - `monitor` operates on a raw `Port` rather than a `Connection`,
+  so it can't check `bridge_host` directly and instead checks a small
+  active-bridge-connection flag `bridge::connect` sets.
+- `Cargo.toml`: two dependency changes - `nix`'s existing entry gained the
+  `"term"` feature (for the PTY calls above), and `ureq` was added
+  (`optional`, wired into the `cli` feature) for the bridge's HTTP control
+  calls. No other dependency, feature, or `[[bin]]` changes.
+
+To pull in a newer upstream release: `git fetch origin` (or add
+`upstream` pointing at `esp-rs/espflash` if `origin` is your own fork)
+and merge/rebase `main` into `espbridge` as usual - the four files above
+are the only ones with any changes to reconcile, and none of upstream's
+own commits since `v4.5.0` have touched them (checked 2026-08-29), so
+this should stay a clean, conflict-free merge for a while.
+
+---
+
 <!-- omit in toc -->
 # espflash
 

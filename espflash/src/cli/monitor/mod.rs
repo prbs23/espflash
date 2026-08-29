@@ -38,6 +38,24 @@ use crate::{
 pub mod external_processors;
 pub mod parser;
 
+/// Resets the target, same as calling `reset_after_flash(serial, pid)`
+/// directly - except when a bridge connection (see `cli::bridge`'s doc
+/// comment) is active, in which case `serial` is a local PTY with no real
+/// control lines for that to drive, so this hits the bridge's HTTP
+/// `/reset` endpoint instead. Used in place of bare `reset_after_flash`
+/// calls in this module specifically because both call sites here only
+/// have a raw `Port`, not a `Connection` (which tracks this per-connection
+/// instead, via its own `bridge_host` field - see that field's doc
+/// comment for why this module needs a different mechanism).
+fn reset_target(serial: &mut Port, pid: u16) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(host) = crate::cli::bridge::active_host() {
+        return crate::cli::bridge::hard_reset(&host).into_diagnostic();
+    }
+
+    reset_after_flash(serial, pid).into_diagnostic()
+}
+
 mod line_endings;
 mod stack_dump;
 mod symbols;
@@ -88,7 +106,7 @@ pub fn monitor(
         println!("    CTRL+C    Exit");
         println!();
     } else if !monitor_args.no_reset {
-        reset_after_flash(&mut serial, pid).into_diagnostic()?;
+        reset_target(&mut serial, pid)?;
     }
 
     let baud = monitor_args.monitor_baud;
@@ -207,7 +225,7 @@ impl InputHandler {
                 match key.code {
                     KeyCode::Char('c') => return Ok(false),
                     KeyCode::Char('r') => {
-                        reset_after_flash(serial, self.pid).into_diagnostic()?;
+                        reset_target(serial, self.pid)?;
                         return Ok(true);
                     }
                     _ => {}
