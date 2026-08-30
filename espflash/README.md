@@ -25,11 +25,13 @@ espflash reset --port bridge://192.168.1.50 --chip esp32c61
   and raw flashing TCP port (default `3333`) are overridable via
   `ESPBRIDGE_HTTP_PORT`/`ESPBRIDGE_FLASH_PORT` if your bridge changed them
   from `bridge_fw`'s defaults.
-- **Linux only** - the bridge backend is built on `nix::pty`
-  (`posix_openpt`/`grantpt`/`unlockpt`), not available elsewhere. Building
-  with the `cli` feature on another OS still works; `bridge://` targets
-  just aren't available there (fails with a clear error instead of not
-  compiling).
+- **Linux only** - kept that way for caution/consistency with the rest of
+  this branch, though nothing in the current implementation (a `TcpStream`
+  wrapped in a `serialport::SerialPort` impl, see `src/cli/bridge.rs`'s
+  `TcpSerialPort`) is actually Linux-specific anymore; it just hasn't been
+  tried on macOS. Building with the `cli` feature on another OS still
+  works; `bridge://` targets just aren't available there (fails with a
+  clear error instead of not compiling).
 - **`hold-in-reset` has no bridge equivalent** and is unpatched - the
   bridge's HTTP control endpoints (`bridge_fw`) only offer pulsed
   reset/bootloader-entry, not an indefinite "assert and hold" primitive.
@@ -45,30 +47,42 @@ espflash reset --port bridge://192.168.1.50 --chip esp32c61
 
 ### What's actually changed from upstream
 
-Everything lives in `src/cli/bridge.rs` (new file, see its doc comment)
-plus small, clearly-commented additions at a handful of call sites that
-otherwise assume a real serial port with real DTR/RTS control lines:
+Everything lives in `src/cli/bridge.rs` (new file, see its doc comment,
+including its `TcpSerialPort` type) plus small, clearly-commented additions
+at a handful of call sites that otherwise assume a real serial port with
+real DTR/RTS control lines:
 
-- `src/cli/mod.rs`: `pub mod bridge;`, and one new branch at the top of
+- `src/cli/mod.rs`: `pub mod bridge;`, one new branch at the top of
   `connect()` that hands off to `bridge::connect()` when `--port` names a
   bridge, instead of the normal `serialport::available_ports()`-based
   discovery (which would reject a bridge target outright - it's not real,
-  OS-discoverable serial hardware).
-- `src/connection/mod.rs`: one new field on `Connection`
-  (`pub(crate) bridge_host: Option<String>`, set only by
-  `bridge::connect`), and a check for it at the top of `reset()` and
-  `reset_after()` - both would otherwise try real DTR/RTS ioctls
-  (`TIOCMGET`/`TIOCMSET`) on the bridge's local PTY, which fails
-  (`ENOTTY`, "Not a typewriter") since a PTY has no real control lines.
+  OS-discoverable serial hardware), and (unix only) boxing the two other
+  sites that construct a `Connection`/`Port` from a real `open_native()`
+  serial port, to match `Port`'s new boxed type - see next bullet.
+- `src/connection/mod.rs`: on unix, `Port` changed from a concrete alias
+  for `serialport::TTYPort` to `Box<dyn PortLike>`, where `PortLike` (new,
+  small local trait) is `SerialPort` plus (for `UnixTightReset`'s combined
+  DTR+RTS ioctl) `AsRawFd`, blanket-implemented for anything satisfying
+  both. This is what lets `bridge::connect` hand back a `TcpSerialPort`
+  (a plain `TcpStream`, see `src/cli/bridge.rs`) instead of needing a real
+  OS-level serial device - `Connection`'s derived `Debug` became a manual
+  impl as a result (trait objects aren't `Debug` unless the trait demands
+  it). Also one new field on `Connection` (`pub(crate) bridge_host:
+  Option<String>`, set only by `bridge::connect`), and a check for it at
+  the top of `reset()` and `reset_after()` - both would otherwise try
+  real DTR/RTS on `TcpSerialPort`, which accepts them as harmless no-ops
+  rather than actually rebooting anything.
 - `src/cli/monitor/mod.rs`: a small `reset_target` helper wrapping the
   module's two direct `reset_after_flash` calls, for the same reason as
   above - `monitor` operates on a raw `Port` rather than a `Connection`,
   so it can't check `bridge_host` directly and instead checks a small
   active-bridge-connection flag `bridge::connect` sets.
-- `Cargo.toml`: two dependency changes - `nix`'s existing entry gained the
-  `"term"` feature (for the PTY calls above), and `ureq` was added
-  (`optional`, wired into the `cli` feature) for the bridge's HTTP control
-  calls. No other dependency, feature, or `[[bin]]` changes.
+- `Cargo.toml`: one dependency change - `ureq` was added (`optional`,
+  wired into the `cli` feature) for the bridge's HTTP control calls. No
+  other dependency, feature, or `[[bin]]` changes (an earlier version of
+  this branch also added `nix`'s `"term"` feature for a PTY-based
+  transport; that's gone now that the transport is a plain `TcpStream` -
+  see "Client transport" in DESIGN.md).
 
 To pull in a newer upstream release: `git fetch origin` (or add
 `upstream` pointing at `esp-rs/espflash` if `origin` is your own fork)

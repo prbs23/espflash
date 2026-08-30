@@ -39,6 +39,7 @@ use self::{
 use crate::{
     connection::{
         Connection,
+        Port,
         reset::{ResetAfterOperation, ResetBeforeOperation},
     },
     error::{Error, MissingPartition, MissingPartitionTable},
@@ -483,8 +484,17 @@ pub fn connect(
         _ => unreachable!(),
     };
 
+    // `Port` is `Box<dyn PortLike>` on unix (see that alias's doc comment -
+    // boxed so a bridge connection's `TcpSerialPort` can share the same
+    // field type as a real `TTYPort`), but stays the concrete `COMPort` on
+    // Windows, where `bridge::connect` doesn't exist.
+    #[cfg(unix)]
+    let serial_port: Port = Box::new(serial_port);
+    #[cfg(windows)]
+    let serial_port: Port = serial_port;
+
     let connection = Connection::new(
-        *Box::new(serial_port),
+        serial_port,
         port_info,
         args.after,
         args.before,
@@ -731,12 +741,53 @@ pub fn serial_monitor(args: MonitorArgs, config: &Config) -> Result<()> {
     };
 
     let chip = flasher.chip();
-    let dev_info = flasher.device_info()?;
+
+    // `NoResetNoSync` promises not to touch the device at all - but
+    // `device_info()` and `xtal_frequency()` below both do real ROM-
+    // protocol round trips (a register read apiece) regardless of that
+    // promise, upstream, unconditionally. That's fine when the connection
+    // really is an already-synced ROM/stub session (the flag's intended
+    // use - see `cli::bridge::connect`'s doc comment), which can answer
+    // them; it's not fine when the target is just whatever's currently
+    // running (a bridge target's normal application firmware, say), which
+    // can't answer a ROM register-read command at all and produces a
+    // confusing "invalid SLIP framing" error instead. Skip both live
+    // queries in that case and fall back to placeholders - this is what
+    // actually lets `monitor` attach to an arbitrary already-running
+    // target with zero interruption, which is the point of combining
+    // `--before no-reset-no-sync` with `monitor` in the first place.
+    // Found the hard way 2026-08-30 against a real bridge target.
+    let no_touch = flasher.connection().before_operation() == ResetBeforeOperation::NoResetNoSync;
+    let dev_info = if no_touch {
+        DeviceInfo {
+            chip,
+            revision: None,
+            // Arbitrary - only affects the ESP32-C2-specific baud-rate
+            // adjustment in `preprocess_monitor_args` below and (if no
+            // `--rom-elf`/bundled ROM ELF is available) defmt timestamp
+            // scaling; not worth an extra flag just to make configurable.
+            crystal_frequency: XtalFrequency::_40Mhz,
+            // Mirrors `Flasher::try_connect`'s own default for this exact
+            // code path: the flash-size-from-efuse detection it would
+            // otherwise do happens *after* the early return for
+            // `NoResetNoSync` (see that fn's last few lines), so this
+            // field is never anything else here.
+            flash_size: FlashSize::_4Mb,
+            features: Vec::new(),
+            mac_address: None,
+        }
+    } else {
+        flasher.device_info()?
+    };
 
     ensure_chip_compatibility(chip, firmware_elf.as_deref())?;
 
     let mut monitor_args = args.monitor_args;
-    let xtal_frequency = chip.xtal_frequency(flasher.connection())?;
+    let xtal_frequency = if no_touch {
+        dev_info.crystal_frequency
+    } else {
+        chip.xtal_frequency(flasher.connection())?
+    };
     preprocess_monitor_args(chip, xtal_frequency, &mut monitor_args);
 
     let elfs = load_monitor_elfs(firmware_elf.as_deref(), &monitor_args, &dev_info)?;
@@ -764,6 +815,9 @@ pub fn serial_monitor(args: MonitorArgs, config: &Config) -> Result<()> {
             .open_native()
             .map_err(Error::from)
             .wrap_err_with(|| format!("Failed to reopen serial port {port_name}"))?;
+        // See the matching cast in `connect` above: `Port` is boxed on unix.
+        #[cfg(unix)]
+        let serial: Port = Box::new(serial);
         monitor_args.no_reset = true;
         return monitor(
             serial,

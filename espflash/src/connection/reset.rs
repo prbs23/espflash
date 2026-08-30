@@ -6,14 +6,13 @@
 // https://github.com/espressif/esptool/blob/a8586d0/esptool/reset.py
 
 #[cfg(unix)]
-use std::{io, os::fd::AsRawFd};
+use std::io;
 use std::{thread::sleep, time::Duration};
 
 #[cfg(unix)]
 use libc::ioctl;
 use log::debug;
 use serde::{Deserialize, Serialize};
-use serialport::SerialPort;
 use strum::{Display, EnumIter, EnumString, VariantNames};
 
 use super::{Connection, Port, USB_SERIAL_JTAG_PID};

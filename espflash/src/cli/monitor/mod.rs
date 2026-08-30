@@ -22,8 +22,6 @@ use crossterm::{
 use external_processors::ExternalProcessors;
 use log::{debug, error, warn};
 use miette::{IntoDiagnostic, Result};
-#[cfg(feature = "serialport")]
-use serialport::SerialPort;
 use strum::{Display, EnumIter, EnumString, VariantNames};
 
 use crate::{

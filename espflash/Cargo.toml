@@ -68,9 +68,7 @@ ureq            = { version = "3.4", optional = true }
 libc = "0.2.174"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# "term" added for cli::bridge's PTY shim (posix_openpt/grantpt/unlockpt/
-# ptsname_r) - the only change to this line for espbridge.
-nix = { version = "0.31", features = ["signal", "time", "term"] }
+nix = { version = "0.31", features = ["signal", "time"] }
 
 [features]
 default = ["cli"]

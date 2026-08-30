@@ -49,8 +49,23 @@ const MAX_SYNC_ATTEMPTS: usize = 5;
 const USB_SERIAL_JTAG_PID: u16 = 0x1001;
 
 #[cfg(unix)]
-/// Alias for the serial TTYPort.
-pub type Port = serialport::TTYPort;
+/// Anything that can back a [`Connection`]: the full `SerialPort` interface,
+/// plus (unix-only) raw fd access for `UnixTightReset`'s combined DTR+RTS
+/// ioctl (see `reset::UnixTightReset::set_dtr_rts`, the one place that needs
+/// more than what `SerialPort` itself exposes). Blanket-implemented for
+/// every type satisfying both, so a real `TTYPort` and `cli::bridge`'s
+/// `TcpSerialPort` (a plain `TcpStream` standing in for a serial port when
+/// connected through an ESP32 debug bridge over the network - see that
+/// module) can both be boxed into the same [`Port`] below.
+pub trait PortLike: SerialPort + std::os::fd::AsRawFd {}
+#[cfg(unix)]
+impl<T: SerialPort + std::os::fd::AsRawFd> PortLike for T {}
+
+#[cfg(unix)]
+/// Alias for whatever's backing this connection - a real `TTYPort`, or (via
+/// `cli::bridge`) a `TcpSerialPort` relaying a bridge connection over the
+/// network instead of a local port.
+pub type Port = Box<dyn PortLike>;
 #[cfg(windows)]
 /// Alias for the serial COMPort.
 pub type Port = serialport::COMPort;
@@ -226,7 +241,6 @@ impl fmt::Display for SecurityInfo {
 }
 
 /// An established connection with a target device.
-#[derive(Debug)]
 pub struct Connection {
     serial: Port,
     port_info: UsbPortInfo,
@@ -237,13 +251,34 @@ pub struct Connection {
     pub(crate) baud: u32,
     /// Set only by `cli::bridge::connect` for a connection made through an
     /// ESP32 debug/programming bridge (see `cli/bridge.rs`) rather than a
-    /// real serial port. `serial` in that case is a local PTY with no real
-    /// control lines, so `reset_after` can't drive DTR/RTS on it - when
-    /// this is set, `reset_after` hits the bridge's HTTP `/reset` endpoint
-    /// instead of the usual reset strategies. This is the *only* addition
-    /// to this struct/impl in this fork; nothing else here is modified
-    /// from upstream `espflash`.
+    /// real serial port. `serial` in that case is a `TcpSerialPort` with no
+    /// real control lines (DTR/RTS on it are harmless no-ops, not errors -
+    /// see that type) - when this is set, `reset_after` hits the bridge's
+    /// HTTP `/reset` endpoint instead of the usual reset strategies, since
+    /// those no-ops wouldn't actually reboot anything. This is the *only*
+    /// addition to this struct/impl in this fork; nothing else here is
+    /// modified from upstream `espflash`.
     pub(crate) bridge_host: Option<String>,
+}
+
+// Manual instead of `#[derive(Debug)]`: `Port` is `Box<dyn PortLike>` on
+// unix, and trait objects aren't `Debug` unless the trait itself demands it
+// (`serialport::SerialPort` doesn't) - rather than adding that bound just
+// for this, print the port's name (which every implementation already
+// exposes) and everything else field-by-field.
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("serial", &self.serial.name())
+            .field("port_info", &self.port_info)
+            .field("decoder", &self.decoder)
+            .field("after_operation", &self.after_operation)
+            .field("before_operation", &self.before_operation)
+            .field("secure_download_mode", &self.secure_download_mode)
+            .field("baud", &self.baud)
+            .field("bridge_host", &self.bridge_host)
+            .finish()
+    }
 }
 
 impl Connection {
@@ -407,11 +442,11 @@ impl Connection {
     /// Resets the device.
     pub fn reset(&mut self) -> Result<(), Error> {
         // Same reasoning as the `bridge_host` check in `reset_after` below:
-        // a bridge connection's `serial` is a PTY with no real control
-        // lines, so the DTR/RTS-based `reset_after_flash` below can't do
-        // anything useful on it (and its ioctls fail outright - PTYs don't
-        // support `TIOCMGET`/`TIOCMSET`). Reboot via the bridge's HTTP
-        // endpoint instead.
+        // a bridge connection's `serial` is a `TcpSerialPort` with no real
+        // control lines, so the DTR/RTS-based `reset_after_flash` below
+        // would silently do nothing on it (its DTR/RTS methods are no-ops,
+        // not errors - see that type's doc comment). Reboot via the
+        // bridge's HTTP endpoint instead, which actually works.
         #[cfg(all(feature = "cli", target_os = "linux"))]
         if let Some(host) = &self.bridge_host {
             return crate::cli::bridge::hard_reset(host);
@@ -430,7 +465,7 @@ impl Connection {
         // `/reset` endpoint can actually do (see `cli::bridge::hard_reset`).
         // Every other `after_operation` below is a protocol-level command
         // sent over the connection rather than a physical DTR/RTS action,
-        // so it works unmodified over the bridge's relayed PTY too.
+        // so it works unmodified over a bridge's `TcpSerialPort` too.
         //
         // `bridge_host` is only ever set from `cli::bridge::connect`, which
         // only exists behind the `cli` feature and on Linux - gated here
